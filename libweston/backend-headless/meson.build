@@ -23,11 +23,13 @@ if get_option('remoting')
 	endif
 endif
 
+dep_uuid = dependency('uuid', required: true)
+
 plugin_headless = shared_library(
 	'headless-backend',
 	srcs_headless,
 	include_directories: common_inc,
-	dependencies: [ dep_libweston_private, dep_libdrm_headers, dep_libdl, dep_libdrm, dep_gbm],
+	dependencies: [ dep_libweston_private, dep_libdrm_headers, dep_libdl, dep_libdrm, dep_gbm, dep_uuid],
 	name_prefix: '',
 	install: true,
 	install_dir: dir_module_libweston,

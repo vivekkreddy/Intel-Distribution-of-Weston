@@ -34,6 +34,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <stdbool.h>
 #include <dlfcn.h>
 
@@ -57,6 +58,22 @@
 #include "linux-dmabuf.h"
 #include "presentation-time-server-protocol.h"
 #include <libweston/windowed-output-api.h>
+
+struct headless_cb_data {
+	struct headless_output *output;
+	struct headless_fb *fb;
+	struct wl_event_source *fence_sync_event_source;
+	int fence_sync_fd;
+	int fd;
+};
+
+struct fb_blob {
+	int width;
+	int height;
+	uint32_t stride;
+	uint32_t format;
+	uint64_t modifier;
+};
 
 static int
 headless_output_start_repaint_loop(struct weston_output *output)
@@ -155,11 +172,158 @@ headless_fb_get_from_bo(struct gbm_bo *bo, struct headless_backend *backend)
 	fb->num_planes = 1;
 	fb->strides[0] = gbm_bo_get_stride(bo);
 	fb->handles[0] = gbm_bo_get_handle(bo).u32;
-	fb->modifier = DRM_FORMAT_MOD_INVALID;
+	fb->format = gbm_bo_get_format(bo);
+	fb->modifier = gbm_bo_get_modifier(bo);
 
 	gbm_bo_set_user_data(bo, fb, headless_fb_destroy_gbm);
 
 	return fb;
+}
+
+static struct vdmabuf_buf *
+lookup_buf_id(uuid_t *buf_id, struct headless_output *output)
+{
+	int i;
+
+	for(i = 0; i < MAX_COLOR_BUFFERS; i++) {
+		if (!uuid_compare((char *)buf_id,
+		    (char *)&output->buffers[i].buf_id))
+			return &output->buffers[i];
+	}
+
+	return NULL;
+}
+
+static int
+find_free_index(struct headless_output *output)
+{
+	int i;
+
+	for(i = 0; i < MAX_COLOR_BUFFERS; i++) {
+		if (!output->buffers[i].busy)
+			return i;
+	}
+
+	return -1;
+}
+
+static int
+vdmabuf_event_handler(int fd, uint32_t mask, void *data)
+{
+	struct headless_output *output = data;
+	struct vdmabuf_buf *buf;
+	uuid_t buf_id;
+	char msg[50];
+	long ret = 0;
+
+	ret = read(fd, msg, sizeof(msg));
+	if (ret <= 0) {
+		weston_log("no event found\n");
+		return 0;
+	}
+
+	memcpy(&buf_id, &msg, 16);
+	buf = lookup_buf_id(&buf_id, output);
+	if (buf) {
+		headless_fb_unref(buf->fb);
+		close(buf->fd);
+		buf->busy = 0;
+		free(buf->fb->blob);
+	}
+
+	return 1;
+}
+
+static int
+vdmabuf_export_frame(int fd, uint32_t mask, void *data)
+{
+	struct headless_cb_data *cb_data = data;
+	struct headless_output *output = cb_data->output;
+	struct headless_fb *fb = cb_data->fb;
+	struct virtio_vdmabuf_export msg = {0};
+	struct fb_blob *blob;
+	int i = find_free_index(output);
+	int ret = 0;
+
+	assert(i >= 0);
+
+	blob = zalloc(sizeof *blob);
+	if (!blob)
+		goto err;
+
+	fb->blob = blob;
+	blob->width = fb->width;
+	blob->height = fb->height;
+	blob->stride = fb->strides[0];
+	blob->format = fb->format;
+	blob->modifier = fb->modifier;
+
+	msg.fd = cb_data->fd;
+	msg.sz_priv = sizeof *blob;
+	msg.priv = (char *)blob;
+	ret = ioctl(output->hfd, VIRTIO_VDMABUF_IOCTL_EXPORT, &msg);
+	if (ret < 0) {
+		weston_log("%s: ioctl failed; ret = %d\n", __func__, ret);
+		close(cb_data->fd);
+		goto err;
+	}
+
+	output->buffers[i].fd = cb_data->fd;
+	memcpy(&output->buffers[i].buf_id , &msg.buf_id, 16);
+
+	output->buffers[i].fb = fb;
+	output->buffers[i].busy = 1;
+
+err:
+	headless_fb_unref(fb);
+	wl_event_source_remove(cb_data->fence_sync_event_source);
+	close(cb_data->fence_sync_fd);
+	free(cb_data);
+
+	return ret;
+}
+
+static int
+headless_vdmabuf_export(struct headless_output *output, struct headless_fb *fb)
+{
+	struct weston_compositor *compositor = output->base.compositor;
+	struct headless_backend *b = to_headless_backend(compositor);
+	struct wl_event_loop *loop;
+	struct headless_cb_data *cb_data;
+	struct wl_event_source *fence_sync_event_source;
+	int fence_sync_fd;
+	int fd, ret;
+
+	cb_data = zalloc(sizeof *cb_data);
+	if (!cb_data)
+		return -1;
+
+	assert(fb->num_planes == 1);
+	ret = drmPrimeHandleToFD(b->drm_fd, fb->handles[0], DRM_CLOEXEC,
+                                 &fd);
+	if (ret) {
+		weston_log("drmPrimeHandleFD failed, errno=%d\n", errno);
+		return -1;
+	}
+
+	headless_fb_ref(fb);
+	fence_sync_fd = b->glri->create_fence_fd(&output->base);
+	if (fence_sync_fd == -1)
+		return 0;
+
+	cb_data->output = output;
+	cb_data->fd = fd;
+	cb_data->fb = fb;
+	cb_data->fence_sync_fd  = fence_sync_fd;
+
+	loop = wl_display_get_event_loop(compositor->wl_display);
+	fence_sync_event_source = wl_event_loop_add_fd(loop, fence_sync_fd,
+				     WL_EVENT_READABLE,
+				     vdmabuf_export_frame,
+				     cb_data);
+	cb_data->fence_sync_event_source = fence_sync_event_source;
+
+	return 0;
 }
 
 int
@@ -168,7 +332,14 @@ headless_output_repaint_gbm(struct headless_output *output,
 {
 	struct weston_compositor *compositor = output->base.compositor;
 	struct headless_backend *b = to_headless_backend(compositor);
+	struct headless_fb *fb;
 	struct gbm_bo *bo;
+
+	/* Drop frame if there isn't free buffers */
+	if (!gbm_surface_has_free_buffers(output->gbm_surface)) {
+		weston_log("%s: Drop frame!!\n", __func__);
+		return -1;
+	}
 
 	compositor->renderer->repaint_output(&output->base, damage);
 
@@ -179,22 +350,16 @@ headless_output_repaint_gbm(struct headless_output *output,
 		return -1;
 	}
 
-	output->curr_fb = headless_fb_get_from_bo(bo, b);
-	if (!output->curr_fb) {
+	fb = headless_fb_get_from_bo(bo, b);
+	if (!fb) {
 		weston_log("failed to get drm_fb for bo\n");
 		gbm_surface_release_buffer(output->gbm_surface, bo);
 		return -1;
 	}
 
-	output->curr_fb->gbm_surface = output->gbm_surface;
-
-	/* FIXME: Is this the right place to do this? */
-	if (output->prev_fb) {
-		headless_fb_unref(output->prev_fb);
-		output->prev_fb = NULL;
-	}
-
-	output->prev_fb = output->curr_fb;
+	fb->gbm_surface = output->gbm_surface;
+	if (headless_vdmabuf_export(output, fb) < 0)
+		return -1;
 
 	pixman_region32_subtract(&compositor->primary_plane.damage,
 				 &compositor->primary_plane.damage, damage);
@@ -316,6 +481,31 @@ headless_output_enable_gl(struct headless_output *output)
 }
 
 #ifdef BUILD_HEADLESS_GBM
+static int
+headless_init_exporter(struct headless_output *output)
+{
+	struct weston_compositor *c = output->base.compositor;
+	struct wl_event_loop *loop;
+
+	output->hfd = open("/dev/virtio-vdmabuf", O_RDWR);
+	if (output->hfd < 0) {
+		weston_log("Failed to open hyper_dmabuf device\n");
+		return -1;
+	}
+
+	loop = wl_display_get_event_loop(c->wl_display);
+	output->vdmabuf_event_source =
+		wl_event_loop_add_fd(loop, output->hfd,
+				     WL_EVENT_READABLE,
+				     vdmabuf_event_handler, output);
+	if (!output->vdmabuf_event_source) {
+		close(output->hfd);
+		return -1;
+	}
+
+	return 0;
+}
+
 int
 headless_output_enable_gl_gbm(struct headless_output *output)
 {
@@ -344,6 +534,8 @@ headless_output_enable_gl_gbm(struct headless_output *output)
 		output->gbm_surface = NULL;
 		return -1;
 	}
+
+	headless_init_exporter(output);
 
 	return 0;
 }

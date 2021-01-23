@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sys/time.h>
 #include <stdbool.h>
+#include <uuid/uuid.h>
 #include <drm_fourcc.h>
 
 #include <libweston/libweston.h>
@@ -26,6 +27,7 @@
 #endif
 
 #include "shared/helpers.h"
+#include "shared/vhost-vdmabuf.h"
 #include "linux-explicit-synchronization.h"
 #include "linux-dmabuf.h"
 #include "presentation-time-server-protocol.h"
@@ -70,6 +72,16 @@ struct headless_fb {
 
 	struct gbm_bo *bo;
 	struct gbm_surface *gbm_surface;
+	void *blob;
+};
+
+#define MAX_COLOR_BUFFERS 4
+
+struct vdmabuf_buf {
+	struct headless_fb *fb;
+	int fd;
+	uuid_t buf_id;
+	int busy;
 };
 
 struct headless_output {
@@ -84,9 +96,11 @@ struct headless_output {
 	uint32_t gbm_format;
 	uint32_t gbm_bo_flags;
 
-	struct headless_fb *prev_fb, *curr_fb;
-
 	bool virtual;
+	int hfd;
+	struct wl_event_source *vdmabuf_event_source;
+	struct vdmabuf_buf buffers[MAX_COLOR_BUFFERS];
+	struct headless_fb *curr_fb;
 #ifdef BUILD_HEADLESS_VIRTUAL
 	submit_frame_cb virtual_submit_frame;
 #endif
